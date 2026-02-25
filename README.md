@@ -1,12 +1,27 @@
-# Aaron Router
+# aaron-router
 
-> Edge-first agentic auth for Web4 — private compute, public proof
+The official public router and SDKs for the OPTX network.
 
-Aaron is the authentication and routing layer for the **OPTX network**. It handles:
+## System Architecture
 
-- **Jett Auth** — Gaze biometric authentication via AGT (Augmented Gaze Tensor)
-- **Jett-Chat SSO** — Wallet signature authentication for real-time chat
-- **x402 Payments** — Micropayments for domain registration and NFT minting
+```mermaid
+graph TD
+    User[User / MOJO Mobile] -->|Gaze Pattern| JETT[JETT Auth]
+    JETT -->|Biometric Signature| OPTX_BRIDGE["OPT𝕏 Bridge"]
+    OPTX_BRIDGE -->|Opaque Proof| AARON[AARON Router]
+    AARON <-->|x402 Payments & Attestations| OPTXChain["OPTX Blockchain<br/>Solana Mainnet"]
+    AARON -->|Domain Management| KNOT[KNOT Terminal]
+```
+
+## Naming Hierarchy
+
+| Name | Full | Role |
+|------|------|------|
+| **JETT Auth** | Joule Encryption Temporal Template Auth | Biometric gaze signature + SSO on Jetson |
+| **OPT𝕏** | Optical Program Technologic 𝕏tension | Secure bridge: JETT Auth → on-chain proofs |
+| **AARON** | Asynchronous Audit RAG Optical Node | On-chain protocol + private edge router |
+| **OPTX** | Public Blockchain & Token Network | Solana mainnet tokens and protocol |
+| **AGT** | Agentive Gaze Tensor | COG/EMO/ENV tensors — performs Web4 actions for JETT Auth |
 
 ## Quick Start
 
@@ -34,7 +49,7 @@ Aaron starts on port 8888 by default. Override with `AARON_PORT` env var.
 ```python
 from sdk.python.aaron_client import AaronClient
 
-client = AaronClient("https://astroknots.space/optx")
+client = AaronClient("https://api.astroknots.space/aaron")
 session = client.create_session(wallet_address="your-solana-pubkey")
 # Show session["qrPayload"] as QR code
 # MOJO app scans QR → submits gaze proof → session becomes "verified"
@@ -46,7 +61,7 @@ status = client.poll_session(session["sessionId"])
 ```typescript
 import { AaronClient } from './sdk/typescript/aaron-client'
 
-const aaron = new AaronClient('https://astroknots.space/optx')
+const aaron = new AaronClient('https://api.astroknots.space/aaron')
 const session = await aaron.createSession({ walletAddress: 'your-pubkey' })
 // Show session.qrPayload as QR code
 const result = await aaron.waitForVerification(session.sessionId)
@@ -57,8 +72,8 @@ console.log(result.agtWeights) // { cog: 0.33, emo: 0.33, env: 0.33 }
 
 ```
 ┌─────────┐     ┌──────────────┐     ┌───────────┐     ┌──────────┐
-│ Frontend │────>│ Aaron Router │────>│ SpacetimeDB│────>│  Solana  │
-│ (Next.js)│<────│ (Jetson Edge)│<────│  (Edge DB) │<────│ (Devnet) │
+│ Frontend │────>│ AARON Router │────>│SpacetimeDB│────>│  Solana  │
+│ (Next.js)│<────│ (Jetson Edge)│<────│ (Edge DB) │<────│(Mainnet) │
 └─────────┘     └──────────────┘     └───────────┘     └──────────┘
      │                  │
      │  1. POST /session│
@@ -70,13 +85,13 @@ console.log(result.agtWeights) // { cog: 0.33, emo: 0.33, env: 0.33 }
      │  5. POST /verify │
      │                  │
      │  6. Poll status  │
-     │  7. "verified" ──│──> Attestation on Solana
+     │  7. "verified" ──│──> Attestation on Solana via OPT𝕏
      │                  │
 ```
 
 ## AGT Regions
 
-The Augmented Gaze Tensor maps eye gaze to three cognitive regions:
+The **Agentive Gaze Tensor** maps eye gaze to three cognitive regions:
 
 | Region | Zone | Description |
 |--------|------|-------------|
@@ -84,7 +99,7 @@ The Augmented Gaze Tensor maps eye gaze to three cognitive regions:
 | **EMO** | 2 (lower-left) | Emotional processing — empathetic awareness |
 | **ENV** | 3 (lower-right) | Environmental scanning — spatial awareness |
 
-Entropy is calculated via Shannon entropy of the AGT weights. Higher entropy (more varied gaze pattern) = stronger authentication. On-chain threshold: **750+**.
+Entropy is calculated via Shannon entropy of the AGT weights. Higher entropy (more varied gaze pattern) = stronger authentication.
 
 ## Environment Variables
 
@@ -92,7 +107,7 @@ Entropy is calculated via Shannon entropy of the AGT weights. Higher entropy (mo
 |----------|---------|-------------|
 | `AARON_PORT` | `8888` | Server port |
 | `SPACETIMEDB_URL` | `http://127.0.0.1:3000` | SpacetimeDB instance |
-| `SOLANA_RPC_URL` | `https://api.devnet.solana.com` | Solana RPC (use Helius for prod) |
+| `SOLANA_RPC_URL` | Helius RPC | Solana RPC endpoint |
 | `ALLOWED_ORIGINS` | `https://jettoptics.ai,...` | CORS origins (comma-separated) |
 
 ## On-Chain Addresses

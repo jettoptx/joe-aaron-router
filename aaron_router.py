@@ -18,7 +18,7 @@ Deploy:
 
 Environment variables:
   AARON_PORT             — Port to listen on (default: 8888)
-  SPACETIMEDB_URL        — SpacetimeDB instance URL (default: http://127.0.0.1:3000)
+  SPACETIMEDB_URL        — SpacetimeDB instance URL (required)
   SOLANA_RPC_URL         — Solana RPC endpoint (Helius recommended)
   ALLOWED_ORIGINS        — Comma-separated CORS origins
 
@@ -42,11 +42,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 # ─── Config ───────────────────────────────────────────────────────────────────
-SPACETIMEDB_URL = os.getenv("SPACETIMEDB_URL", "http://127.0.0.1:3000")
-SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.devnet.solana.com")
+SPACETIMEDB_URL = os.getenv("SPACETIMEDB_URL", "")
+SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "")
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS",
-    "https://jettoptics.ai,https://astroknots.space,http://localhost:3000",
+    "https://jettoptics.ai,https://astroknots.space",
 ).split(",")
 
 SESSION_TTL = 120  # seconds (2 minutes)

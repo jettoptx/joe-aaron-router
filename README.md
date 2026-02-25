@@ -106,8 +106,8 @@ Entropy is calculated via Shannon entropy of the AGT weights. Higher entropy (mo
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `AARON_PORT` | `8888` | Server port |
-| `SPACETIMEDB_URL` | `http://127.0.0.1:3000` | SpacetimeDB instance |
-| `SOLANA_RPC_URL` | Helius RPC | Solana RPC endpoint |
+| `SPACETIMEDB_URL` | _(required)_ | SpacetimeDB instance URL |
+| `SOLANA_RPC_URL` | _(required)_ | Solana RPC endpoint (e.g. Helius) |
 | `ALLOWED_ORIGINS` | `https://jettoptics.ai,...` | CORS origins (comma-separated) |
 
 ## On-Chain Addresses

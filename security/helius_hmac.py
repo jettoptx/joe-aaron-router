@@ -1,29 +1,33 @@
 """
-Helius webhook HMAC verification.
+Helius webhook auth-header verification.
 
-Helius signs webhook payloads with HMAC-SHA256 using the secret you set
-on the webhook in dashboard.helius.dev. The signature arrives in the
-`Authorization` or `X-Helius-Signature` header (Helius has used both
-during 2025-2026 — we accept either).
+Helius's webhook config (dashboard.helius.dev → Webhooks → Add Webhook)
+exposes an "Authentication Header" field. Helius forwards that exact
+string back to us as the `Authorization` header on every webhook POST —
+it's a shared bearer token, NOT an HMAC of the body.
 
 We compare in constant time to prevent timing-oracle attacks.
+
+Function name kept (`verify_helius_signature`) for API stability across
+the existing routers/tests; the implementation is shared-secret compare.
+The `raw_body` parameter is unused but kept so callers don't need to
+change.
 """
 
 from __future__ import annotations
 
-import hashlib
 import hmac
 import os
 
 
 HELIUS_HEADER_CANDIDATES = (
-    "x-helius-signature",
     "authorization",
+    "x-helius-signature",  # legacy — still accepted in case Helius adds HMAC
 )
 
 
 class HeliusSignatureError(Exception):
-    """Raised when a Helius webhook signature is missing or invalid."""
+    """Raised when a Helius webhook auth header is missing or invalid."""
 
 
 def _get_signature(headers: dict[str, str]) -> str | None:
@@ -32,25 +36,30 @@ def _get_signature(headers: dict[str, str]) -> str | None:
     for name in HELIUS_HEADER_CANDIDATES:
         if name in lowered:
             value = lowered[name]
-            # Some webhook providers prefix with `sha256=`. Strip if present.
-            if value.lower().startswith("sha256="):
+            # Tolerate wrappers some users add: `Bearer <secret>` or
+            # `sha256=<value>`. Strip and compare the raw secret.
+            if value.lower().startswith("bearer "):
+                value = value.split(" ", 1)[1]
+            elif value.lower().startswith("sha256="):
                 value = value.split("=", 1)[1]
             return value
     return None
 
 
 def verify_helius_signature(
-    raw_body: bytes,
+    raw_body: bytes,  # noqa: ARG001 — kept for API stability
     headers: dict[str, str],
     secret: str | None = None,
 ) -> None:
-    """Verify a Helius webhook payload. Raises HeliusSignatureError on failure.
+    """Verify a Helius webhook auth header. Raises HeliusSignatureError on failure.
 
     Args:
-      raw_body: the exact bytes of the request body as received.
-      headers: request headers (any case).
-      secret:  HMAC secret. If None, reads from env `HELIUS_WEBHOOK_SECRET`.
-               If still empty, raises (we never accept unsigned payloads).
+      raw_body: unused (kept for API stability with HMAC-style callers).
+      headers:  request headers (any case).
+      secret:   shared secret that you pasted into the Helius webhook's
+                "Authentication Header" field. Reads `HELIUS_WEBHOOK_SECRET`
+                env var if None. Raises if still empty (we never accept
+                unauthenticated payloads).
     """
     secret = secret if secret is not None else os.getenv("HELIUS_WEBHOOK_SECRET", "")
     if not secret:
@@ -58,13 +67,7 @@ def verify_helius_signature(
 
     provided = _get_signature(headers)
     if not provided:
-        raise HeliusSignatureError("missing Helius signature header")
+        raise HeliusSignatureError("missing Helius auth header")
 
-    expected = hmac.new(
-        secret.encode("utf-8"),
-        raw_body,
-        hashlib.sha256,
-    ).hexdigest()
-
-    if not hmac.compare_digest(expected, provided):
-        raise HeliusSignatureError("Helius signature mismatch")
+    if not hmac.compare_digest(secret, provided):
+        raise HeliusSignatureError("Helius auth header mismatch")

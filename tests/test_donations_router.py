@@ -7,8 +7,6 @@ all exercised against the real implementations.
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import os
 from typing import Any
@@ -73,10 +71,6 @@ def client(app: FastAPI) -> TestClient:
 
 VALID_SIG = "5j7s" + "1" * 70  # base58-ish length 74
 VALID_WALLET = "EFvgELE1Hb4PC5tbPTAe8v1uEDGee8nwYBMCU42bZRGk"
-
-
-def _hmac_sig(body: bytes) -> str:
-    return hmac.new(HELIUS_SECRET.encode(), body, hashlib.sha256).hexdigest()
 
 
 # ── /donations/claim ──────────────────────────────────────────────────────
@@ -180,7 +174,7 @@ def test_webhook_processes_native_transfer(client: TestClient, app: FastAPI) -> 
         content=body,
         headers={
             "content-type": "application/json",
-            "x-helius-signature": _hmac_sig(body),
+            "authorization": HELIUS_SECRET,
         },
     )
     assert r.status_code == 200, r.text
@@ -204,7 +198,7 @@ def test_webhook_skips_failed_tx(client: TestClient, app: FastAPI) -> None:
         content=body,
         headers={
             "content-type": "application/json",
-            "x-helius-signature": _hmac_sig(body),
+            "authorization": HELIUS_SECRET,
         },
     )
     assert r.status_code == 200
@@ -235,7 +229,7 @@ def test_webhook_picks_up_xahau_from_prior_claim(client: TestClient, app: FastAP
         content=body,
         headers={
             "content-type": "application/json",
-            "x-helius-signature": _hmac_sig(body),
+            "authorization": HELIUS_SECRET,
         },
     )
     assert r.status_code == 200

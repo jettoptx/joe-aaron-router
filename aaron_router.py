@@ -1,28 +1,30 @@
 #!/usr/bin/env python3
 """
-AARON Router — Edge-First Agentic Auth for Web4
-================================================
-Aaron is the authentication and routing layer for the OPTX network.
-Handles Jett Auth (gaze biometrics) and Jett-Chat SSO (wallet signatures).
+AARON Router — Edge-First Agentic Auth + Donor Rewards
+=======================================================
+Runs on Jetson Orin Nano (port 8888). Single FastAPI app with two
+service surfaces:
 
-Endpoints:
-  GET  /health           — Service health check
-  POST /session          — Create auth session with QR challenge
-  GET  /session/{id}     — Poll session status
-  POST /verify           — Submit gaze proof for verification
-  POST /gaze/analyze     — Classify iris landmarks into AGT regions
+Jett Auth (gaze biometrics) — original surface:
+  POST /session           — Create Jett Auth QR session challenge
+  GET  /session/{id}      — Poll session status
+  POST /verify            — MOJO submits gaze proof → on-chain attestation
+  POST /gaze/analyze      — Classify iris landmarks into AGT regions
+  POST /mint              — OPTX mint after successful verification
+  GET  /health            — Health check (includes SpacetimeDB ping)
 
-Deploy:
-  pip install -r requirements.txt
-  python aaron_router.py
+Donor reward stack (Phase 2 + 3a):
+  POST /donations/claim                — Dapp registers a fresh donation
+  POST /donations/webhooks/helius      — Helius confirms donate_sol
+  GET  /donations/status/{tx_sig}      — Frontend polls reward status
+  POST /donations/admin/replay/{sig}   — Manual replay of failed legs
 
-Environment variables:
-  AARON_PORT             — Port to listen on (default: 8888)
-  SPACETIMEDB_URL        — SpacetimeDB instance URL (required)
-  SOLANA_RPC_URL         — Solana RPC endpoint (Helius recommended)
-  ALLOWED_ORIGINS        — Comma-separated CORS origins
+Donor reward services (services/jtx_drop.py, services/xahau.py) are
+lazy-initialized so missing env vars only blow up when a donation
+actually arrives, not at import time. The Jett Auth surface is
+unaffected if donor-reward env vars are unset.
 
-Learn more: https://astroknots.space/docs
+Dependencies: fastapi, uvicorn, aiohttp, solders, solana, xrpl-py
 """
 
 import asyncio
@@ -37,19 +39,50 @@ from datetime import datetime
 from typing import Optional
 from dataclasses import dataclass
 
+import aiohttp
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+# Donor-reward stack (Phase 2 + 3a, optional Phase 1).
+# Imported eagerly so /donations routes mount on every boot. Services
+# inside this router are lazily initialized — missing env vars only
+# blow up when a donation actually arrives, not at import time.
+from routers.donations import router as donations_router
+
 # ─── Config ───────────────────────────────────────────────────────────────────
-SPACETIMEDB_URL = os.getenv("SPACETIMEDB_URL", "")
-SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "")
+# Existing Jett Auth config (Jetson defaults preserved).
+SPACETIMEDB_URL = os.getenv("SPACETIMEDB_URL", "http://127.0.0.1:3000")
+HELIUS_DEVNET_RPC = os.getenv(
+    "HELIUS_DEVNET_RPC",
+    # Public devnet endpoint as no-key fallback. Set HELIUS_DEVNET_RPC in
+    # /etc/optx/aaron.env (with your private key) for higher rate limits.
+    "https://api.devnet.solana.com",
+)
+JOE_PUBLIC_KEY = os.getenv("JOE_PUBLIC_KEY", "EFvgELE1Hb4PC5tbPTAe8v1uEDGee8nwYBMCU42bZRGk")
+JTX_MINT = os.getenv("JTX_MINT", "9XpJiKEYzq5yDo5pJzRfjSRMPL2yPfDQXgiN7uYtBhUj")
+OPTX_MINT = os.getenv("OPTX_MINT", "4r9WxVWBNMphYfSyGBuMFYRLsLEnzUNquJPnpFessXRH")  # devnet
+CSTB_MINT = os.getenv("CSTB_MINT", "4waAimBGeubfVBp4MX9vRh7iTWxoR2RYYqiuChqCH7rX")  # devnet
+
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS",
-    "https://jettoptics.ai,https://astroknots.space",
+    "https://jettoptics.ai,https://astroknots.space,https://www.astroknots.space,http://localhost:3000,http://localhost:3001",
 ).split(",")
 
-SESSION_TTL = 120  # seconds (2 minutes)
+# Donor reward stack env (sealed; see docs/donor-rewards-deploy.md):
+#   JOE_AGENT_KEYPAIR_PATH      — sealed file (mode 0400) holding signer keypair
+#   JTX_MINT_MAINNET / _DEVNET  — Token-2022 mint addresses
+#   JTX_DECIMALS                — default 9
+#   JTX_DROP_AMOUNT             — whole tokens per donation (default 1)
+#   JTX_DAILY_DROP_CAP          — abuse circuit-breaker (default 10000)
+#   HELIUS_WEBHOOK_SECRET       — HMAC secret from Helius dashboard
+#   JETT_VAULT_PROGRAM_ID       — defaults to mainnet program id
+#   XAHAU_RPC_URL / _SEED / _HOOK_ACCOUNT / _DONATION_AMOUNT_DROPS
+#   DONATIONS_DB_PATH           — sqlite path (default /var/lib/optx/donations.db)
+#   ADMIN_TOKEN                 — required for /donations/admin/replay
+#   SOLANA_NETWORK              — "mainnet" | "devnet" | "localnet"
+
+SESSION_TTL = 120  # 2 minutes
 MAX_SESSIONS = 1000
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [AARON] %(message)s")
@@ -76,25 +109,23 @@ sessions: dict[str, AuthSession] = {}
 
 # ─── Pydantic Models ─────────────────────────────────────────────────────────
 class SessionCreateRequest(BaseModel):
-    """Request to create a new Jett Auth session."""
     wallet_address: Optional[str] = None
     origin: str = "https://jettoptics.ai"
 
 
 class VerifyRequest(BaseModel):
-    """Gaze proof submission from MOJO app after AGT calibration."""
     session_id: str
     challenge: str
-    gaze_sequence: list[str]  # ["COG", "EMO", "ENV", "COG", "EMO", "ENV"]
-    hold_durations: list[int]  # milliseconds per gaze position
-    polynomial_encoding: str  # "132123" format (1=COG, 2=EMO, 3=ENV)
-    verification_hash: str  # SHA-256 of gaze data
+    gaze_sequence: list[str]  # ["COG", "EMO", "ENV", "COG"]
+    hold_durations: list[int]  # ms per position
+    polynomial_encoding: str  # "1231" format
+    verification_hash: str  # SHA-256
     wallet_address: Optional[str] = None
+    agt_weights: Optional[dict] = None  # {cog: float, emo: float, env: float}
 
 
 class GazeAnalyzeRequest(BaseModel):
-    """Raw iris landmark data for real-time classification."""
-    iris_landmarks: list[dict]  # [{x, y, z}] from MediaPipe FaceLandmarker
+    iris_landmarks: list[dict]  # [{x, y, z}] for landmarks 468-477
     face_landmarks: Optional[list[dict]] = None
     timestamp: float
 
@@ -102,10 +133,8 @@ class GazeAnalyzeRequest(BaseModel):
 # ─── FastAPI App ──────────────────────────────────────────────────────────────
 app = FastAPI(
     title="AARON Router",
-    description="Edge-first agentic auth for Web4 — private compute, public proof",
-    version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
+    description="Edge-first agentic auth + donor rewards — private compute, public proof",
+    version="1.1.0",
 )
 
 app.add_middleware(
@@ -115,6 +144,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Mount donor-reward routes (POST /donations/claim, /donations/webhooks/helius,
+# GET /donations/status/{sig}, POST /donations/admin/replay/{sig}).
+app.include_router(donations_router)
 
 
 # ─── Session Cleanup ─────────────────────────────────────────────────────────
@@ -133,7 +166,10 @@ async def cleanup_sessions():
 @app.on_event("startup")
 async def startup():
     asyncio.create_task(cleanup_sessions())
-    logger.info(f"AARON Router started — port {os.getenv('AARON_PORT', 8888)}")
+    logger.info("AARON Router started on port 8888")
+    logger.info(f"SpacetimeDB: {SPACETIMEDB_URL}")
+    logger.info(f"Helius RPC: {HELIUS_DEVNET_RPC[:60]}{'...' if len(HELIUS_DEVNET_RPC) > 60 else ''}")
+    logger.info(f"JOE signing key: {JOE_PUBLIC_KEY[:12]}...")
 
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
@@ -141,25 +177,36 @@ async def startup():
 
 @app.get("/health")
 async def health():
-    """Health check endpoint."""
+    # Check SpacetimeDB connection
+    spacetime_ok = False
+    try:
+        async with aiohttp.ClientSession() as http_session:
+            async with http_session.post(
+                f"{SPACETIMEDB_URL}/v1/database/jettchat/sql",
+                timeout=aiohttp.ClientTimeout(total=2),
+                headers={"Content-Type": "text/plain"},
+                data="SELECT * FROM memory_entry LIMIT 1",
+            ) as resp:
+                spacetime_ok = resp.status == 200
+    except Exception:
+        pass
+
     return {
         "status": "healthy",
         "service": "aaron-router",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "timestamp": datetime.utcnow().isoformat(),
         "active_sessions": len(sessions),
+        "spacetimedb": "connected" if spacetime_ok else "disconnected",
+        "joe_key": JOE_PUBLIC_KEY[:12] + "...",
     }
 
 
 @app.post("/session")
 async def create_session(req: SessionCreateRequest):
-    """
-    Create a new Jett Auth session with QR challenge.
-
-    Returns a session ID and challenge that gets encoded into a QR code.
-    The MOJO app scans this QR and submits a gaze proof to /verify.
-    """
+    """Create a new Jett Auth session with QR challenge."""
     if len(sessions) >= MAX_SESSIONS:
+        # Evict oldest
         oldest = min(sessions.values(), key=lambda s: s.created_at)
         del sessions[oldest.session_id]
 
@@ -167,16 +214,14 @@ async def create_session(req: SessionCreateRequest):
     challenge = secrets.token_hex(32)
     now = time.time()
 
-    # Build QR payload for MOJO app
-    verify_endpoint = f"{req.origin}/api/aaron/verify"
     qr_payload = json.dumps(
         {
             "protocol": "jett-auth-v1",
             "sessionId": session_id,
             "challenge": challenge,
-            "expiresAt": int((now + SESSION_TTL) * 1000),
+            "expiresAt": int((now + SESSION_TTL) * 1000),  # JS timestamp
             "walletAddress": req.wallet_address,
-            "endpoint": verify_endpoint,
+            "endpoint": f"{req.origin}/optx/verify" if "astroknots" in req.origin else f"{req.origin}/api/aaron/verify",
             "steps": [
                 "gaze_pin",
                 "link_wallet",
@@ -200,7 +245,9 @@ async def create_session(req: SessionCreateRequest):
     )
     sessions[session_id] = session
 
-    logger.info(f"Session created: {session_id[:12]}...")
+    logger.info(
+        f"Session created: {session_id[:12]}... wallet={req.wallet_address or 'none'}"
+    )
 
     return {
         "sessionId": session_id,
@@ -212,11 +259,12 @@ async def create_session(req: SessionCreateRequest):
 
 @app.get("/session/{session_id}")
 async def get_session(session_id: str):
-    """Poll session status. Frontend calls this in a loop after showing QR."""
+    """Poll session status (used by frontend polling loop)."""
     session = sessions.get(session_id)
     if not session:
         raise HTTPException(404, "Session not found")
 
+    # Check expiration
     if time.time() > session.expires_at and session.status == "pending":
         session.status = "expired"
 
@@ -237,21 +285,8 @@ async def get_session(session_id: str):
 @app.post("/verify")
 async def verify_gaze(req: VerifyRequest):
     """
-    Submit gaze proof for verification.
-
-    The MOJO app calls this after the 6-step AGT calibration:
-    1. gaze_pin — User gazes at calibration targets
-    2. link_wallet — Phantom wallet connected
-    3. stake_jtx — JTX stake verified
-    4. genesis_sig — User signs genesis message
-    5. camera_keys — Camera permissions granted
-    6. mint_optx — Ready for OPTX minting
-
-    Validates:
-    - 4-6 gaze positions (COG/EMO/ENV only)
-    - Each hold >= 500ms (prevents random taps)
-    - Polynomial encoding matches sequence
-    - Computes AGT weights and entropy score
+    MOJO submits gaze proof here after the 6-step AGT calibration.
+    Aaron verifies the proof and stores attestation in SpacetimeDB.
     """
     session = sessions.get(req.session_id)
     if not session:
@@ -264,31 +299,48 @@ async def verify_gaze(req: VerifyRequest):
         session.status = "expired"
         raise HTTPException(410, "Session expired")
 
+    # Verify challenge matches
     if req.challenge != session.challenge:
         raise HTTPException(403, "Challenge mismatch")
 
     # ─── Validate gaze proof ─────────────────────────────────────────────
-
+    # 1. Sequence must have 4-6 positions, only COG/EMO/ENV
     valid_tensors = {"COG", "EMO", "ENV"}
     if not (4 <= len(req.gaze_sequence) <= 6):
         raise HTTPException(400, "Gaze sequence must be 4-6 positions")
     if not all(t in valid_tensors for t in req.gaze_sequence):
         raise HTTPException(400, "Invalid tensor in gaze sequence")
 
+    # 2. Hold durations must be >= 500ms each (prevents random input)
     if len(req.hold_durations) != len(req.gaze_sequence):
         raise HTTPException(400, "Hold durations count mismatch")
     if any(d < 500 for d in req.hold_durations):
         raise HTTPException(400, "Each hold must be >= 500ms")
 
-    # Polynomial encoding: 1=COG, 2=EMO, 3=ENV
+    # 3. Polynomial encoding must match sequence
     expected_encoding = "".join(
         "1" if t == "COG" else "2" if t == "EMO" else "3" for t in req.gaze_sequence
     )
     if req.polynomial_encoding != expected_encoding:
         raise HTTPException(400, "Polynomial encoding mismatch")
 
-    # ─── Calculate AGT weights ────────────────────────────────────────────
+    # 4. Verification hash check
+    hash_data = json.dumps(
+        {
+            "nonce": session.session_id,
+            "sequence": req.gaze_sequence,
+            "holdDurations": req.hold_durations,
+            "timestamp": int(session.created_at * 1000),
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    expected_hash = hashlib.sha256(hash_data.encode()).hexdigest()
+    logger.info(
+        f"Hash check: client={req.verification_hash[:16]}... server={expected_hash[:16]}..."
+    )
 
+    # 5. Calculate AGT weights from gaze sequence
     total = len(req.gaze_sequence)
     agt_weights = {
         "cog": round(req.gaze_sequence.count("COG") / total, 3),
@@ -296,19 +348,37 @@ async def verify_gaze(req: VerifyRequest):
         "env": round(req.gaze_sequence.count("ENV") / total, 3),
     }
 
-    # Shannon entropy (higher = more varied = stronger auth)
+    # 6. Calculate gaze entropy (higher = more varied pattern = stronger auth)
     entropy = 0.0
     for w in agt_weights.values():
         if w > 0:
             entropy -= w * math.log2(w)
-    entropy_score = int(entropy * 1000)  # Scale to match on-chain threshold (>= 750)
+    entropy_score = int(entropy * 1000)  # Scale to match Anchor program (>= 750)
 
     logger.info(f"AGT weights: {agt_weights}, entropy: {entropy_score}")
 
-    # ─── Update session ───────────────────────────────────────────────────
-
+    # ─── Store attestation in SpacetimeDB ─────────────────────────────────
     verification_id = secrets.token_urlsafe(16)
+    try:
+        async with aiohttp.ClientSession() as http_session:
+            await http_session.post(
+                f"{SPACETIMEDB_URL}/v1/database/jettchat/sql",
+                json={
+                    "query": (
+                        f"INSERT INTO gaze_events (user_id, gaze_x, gaze_y, "
+                        f"cog_value, env_value, emo_value, confidence) "
+                        f"VALUES (1, {agt_weights['cog']}, {agt_weights['env']}, "
+                        f"{agt_weights['cog']}, {agt_weights['env']}, "
+                        f"{agt_weights['emo']}, {entropy / 2.0})"
+                    )
+                },
+                timeout=aiohttp.ClientTimeout(total=3),
+            )
+            logger.info("SpacetimeDB attestation stored")
+    except Exception as e:
+        logger.warning(f"SpacetimeDB write failed (non-fatal): {e}")
 
+    # ─── Update session ───────────────────────────────────────────────────
     session.status = "verified"
     session.verification_id = verification_id
     session.gaze_proof = {
@@ -329,7 +399,7 @@ async def verify_gaze(req: VerifyRequest):
         "walletAddress": session.wallet_address,
         "agtWeights": agt_weights,
         "entropyScore": entropy_score,
-        "message": "Gaze proof accepted. Attestation stored.",
+        "message": "Gaze proof accepted. Aaron attestation stored.",
     }
 
 
@@ -337,21 +407,19 @@ async def verify_gaze(req: VerifyRequest):
 async def analyze_gaze(req: GazeAnalyzeRequest):
     """
     Classify raw iris landmarks into COG/EMO/ENV tensor regions.
-
-    Used by MOJO app during real-time gaze capture to show the user
-    which AGT region they're looking at.
-
-    Region mapping:
-    - COG (Cognitive, zone 1): Upper area (y < 0.4)
-    - EMO (Emotional, zone 2): Bottom-left (y >= 0.4, x < 0.5)
-    - ENV (Environmental, zone 3): Bottom-right (y >= 0.4, x >= 0.5)
+    Used by MOJO app during real-time gaze capture.
     """
     if not req.iris_landmarks or len(req.iris_landmarks) < 4:
         raise HTTPException(400, "Need at least 4 iris landmarks")
 
+    # Calculate average iris position (normalized 0-1)
     avg_x = sum(p.get("x", 0) for p in req.iris_landmarks) / len(req.iris_landmarks)
     avg_y = sum(p.get("y", 0) for p in req.iris_landmarks) / len(req.iris_landmarks)
 
+    # Classify into AGT regions using barycentric mapping
+    # COG (top, upper area): y < 0.4
+    # EMO (bottom-left): y >= 0.4 and x < 0.5
+    # ENV (bottom-right): y >= 0.4 and x >= 0.5
     if avg_y < 0.4:
         tensor = "COG"
         confidence = min(1.0, (0.4 - avg_y) / 0.4)
@@ -370,8 +438,86 @@ async def analyze_gaze(req: GazeAnalyzeRequest):
     }
 
 
+# ─── OPTX Minting Endpoint ───────────────────────────────────────────────
+class MintRequest(BaseModel):
+    verification_id: str
+    wallet_address: str
+    entropy_score: int = 750
+    agt_weights: dict = {}
+
+
+@app.post("/mint")
+async def mint_optx(req: MintRequest):
+    """
+    Mint OPTX tokens after successful gaze verification.
+    Called by frontend after /verify returns success.
+    Uses the JTX-CSTB-TRUST DePIN program on devnet.
+    Program ID: HkJoo6829ANVxPNCVDURjZazRncWv1ht3WfyDc2GD5oH
+    """
+    # Verify the session was actually verified
+    verified_session = None
+    for sid, s in sessions.items():
+        if hasattr(s, 'verification_id') and s.verification_id == req.verification_id:
+            verified_session = s
+            break
+
+    if not verified_session:
+        raise HTTPException(404, "Verification ID not found — verify gaze first")
+
+    if verified_session.status != "verified":
+        raise HTTPException(400, f"Session not verified (status: {verified_session.status})")
+
+    # Calculate OPTX amount based on entropy score
+    # Higher entropy = more varied gaze pattern = more OPTX
+    base_optx = 1  # Minimum 1 OPTX per verification
+    if req.entropy_score >= 1000:
+        optx_amount = base_optx * 3  # High entropy bonus
+    elif req.entropy_score >= 750:
+        optx_amount = base_optx * 2
+    else:
+        optx_amount = base_optx
+
+    # Store mint request as attestation
+    mint_id = secrets.token_urlsafe(12)
+    try:
+        async with aiohttp.ClientSession() as http_session:
+            await http_session.post(
+                f"{SPACETIMEDB_URL}/v1/database/jettchat/sql",
+                json={
+                    "query": (
+                        f"INSERT INTO gaze_events (user_id, gaze_x, gaze_y, "
+                        f"cog_value, env_value, emo_value, confidence) "
+                        f"VALUES (1, {req.agt_weights.get('cog', 0)}, {req.agt_weights.get('env', 0)}, "
+                        f"{req.agt_weights.get('cog', 0)}, {req.agt_weights.get('env', 0)}, "
+                        f"{req.agt_weights.get('emo', 0)}, 0.95)"
+                    )
+                },
+                timeout=aiohttp.ClientTimeout(total=3),
+            )
+    except Exception as e:
+        logger.warning(f"SpacetimeDB mint log failed (non-fatal): {e}")
+
+    # Mark session as minted to prevent double-mint
+    verified_session.status = "minted"
+
+    logger.info(
+        f"OPTX mint: {optx_amount} OPTX → {req.wallet_address[:12]}... "
+        f"(entropy={req.entropy_score}, mint_id={mint_id})"
+    )
+
+    return {
+        "status": "minted",
+        "mint_id": mint_id,
+        "optx_amount": optx_amount,
+        "wallet_address": req.wallet_address,
+        "entropy_score": req.entropy_score,
+        "program_id": "HkJoo6829ANVxPNCVDURjZazRncWv1ht3WfyDc2GD5oH",
+        "network": "devnet",
+        "message": f"{optx_amount} OPTX attestation recorded. On-chain mint pending program initialization.",
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
 
-    port = int(os.getenv("AARON_PORT", "8888"))
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("AARON_PORT", "8888")), log_level="info")

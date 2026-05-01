@@ -2,6 +2,8 @@
 
 The official public router and SDKs for the OPTX network.
 
+> AARON serves both [JettChat](https://github.com/jettoptx/joe-jettchat-app) modes — **xChat Native** (X OAuth + Solana wallet) and **Phantom Mode** (Tor + post-quantum, implemented in [Secure-Legion/android](https://github.com/Secure-Legion/android)). Auth surface details: [jettoptx.dev/docs/authentication/jett-auth](https://jettoptx.dev/docs/authentication/jett-auth).
+
 ## System Architecture
 
 ```mermaid

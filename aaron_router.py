@@ -517,6 +517,124 @@ async def mint_optx(req: MintRequest):
     }
 
 
+# ─── Handshake Routes (B3.8 — web ↔ iOS first-gaze bridge) ───────────────
+# Per the v2 architecture spec at joe-jett-mojo/docs/web-to-ios-handshake-spec.md,
+# AARON brokers the cross-surface state when a user starts on web (jettchat
+# /support or astroknots.space/stake) and needs to complete first-gaze in MOJO
+# iOS. Three endpoints, mirrors of the /donations/* shape.
+#
+#   POST /handshake/start    web POSTs {sub, pubkey, source}; AARON records
+#                            user_first_gaze_pending; returns handshake_id + expiry
+#   POST /handshake/done     iOS POSTs {sub, pubkey, agt_pda, attestation_sig};
+#                            AARON flips state → user_first_gaze_complete
+#   GET  /handshake/status   frontend polls with ?sub=<zitadel_sub>; returns the
+#                            latest state for that user
+#
+# v1 keeps state in-memory — pragmatic; promote to SpacetimeDB once iOS
+# subscribes for real-time updates. Restart of AARON loses pending handshakes,
+# users just re-initiate (web banner re-shows since /handshake/status returns
+# "none"). Acceptable trade-off for ship-today scope.
+
+_handshakes: dict[str, dict] = {}  # keyed by zitadel sub
+_HANDSHAKE_TTL = 30 * 60  # 30 minutes pending → expired
+
+
+class HandshakeStart(BaseModel):
+    sub: str  # Zitadel sub claim — the canonical user identity
+    pubkey: str  # Privy-issued (or Phantom-imported) Solana pubkey
+    source: str = "web"  # "web" | "ios" — which surface initiated
+
+
+class HandshakeDone(BaseModel):
+    sub: str
+    pubkey: str
+    agt_pda: str  # The on-chain agt_attestation PDA the user just minted
+    attestation_sig: str  # The mint/audit tx signature for audit trail
+
+
+@app.post("/handshake/start")
+async def handshake_start(req: HandshakeStart):
+    """Web initiates a first-gaze handshake. Returns a handshake ID + expiry."""
+    handshake_id = secrets.token_urlsafe(16)
+    expires_at = time.time() + _HANDSHAKE_TTL
+    _handshakes[req.sub] = {
+        "handshake_id": handshake_id,
+        "sub": req.sub,
+        "pubkey": req.pubkey,
+        "source": req.source,
+        "state": "pending",
+        "expires_at": expires_at,
+        "created_at": time.time(),
+    }
+    logger.info(f"handshake/start: sub={req.sub[:12]} pubkey={req.pubkey[:8]} src={req.source}")
+    return {
+        "handshake_id": handshake_id,
+        "sub": req.sub,
+        "state": "pending",
+        "expires_at": int(expires_at * 1000),
+    }
+
+
+@app.post("/handshake/done")
+async def handshake_done(req: HandshakeDone):
+    """MOJO iOS reports first-gaze complete. AARON flips the row state."""
+    record = _handshakes.get(req.sub)
+    if not record:
+        # Allow late-binding — iOS may finish before web initiated, e.g.
+        # mobile-first onboarding flow.
+        record = {
+            "handshake_id": secrets.token_urlsafe(16),
+            "sub": req.sub,
+            "pubkey": req.pubkey,
+            "source": "ios",
+            "state": "pending",
+            "expires_at": time.time() + _HANDSHAKE_TTL,
+            "created_at": time.time(),
+        }
+        _handshakes[req.sub] = record
+
+    # Sanity check: pubkey on /done must match what /start recorded.
+    # If the wallet changed mid-flow that's an architectural error worth
+    # surfacing rather than silently accepting.
+    if record["pubkey"] != req.pubkey:
+        raise HTTPException(403, "Pubkey mismatch with handshake/start")
+
+    record.update({
+        "state": "complete",
+        "agt_pda": req.agt_pda,
+        "attestation_sig": req.attestation_sig,
+        "completed_at": time.time(),
+    })
+    logger.info(f"handshake/done: sub={req.sub[:12]} agt={req.agt_pda[:8]}")
+    return {
+        "ok": True,
+        "sub": req.sub,
+        "state": "complete",
+        "agt_pda": req.agt_pda,
+        "mint_eligible": True,
+    }
+
+
+@app.get("/handshake/status")
+async def handshake_status(sub: str):
+    """Frontend polls for current state. One row per Zitadel sub."""
+    record = _handshakes.get(sub)
+    if not record:
+        return {"state": "none"}
+    # Lazy expiry check.
+    if record["state"] == "pending" and time.time() > record["expires_at"]:
+        record["state"] = "expired"
+    return {
+        "state": record["state"],
+        "sub": record["sub"],
+        "pubkey": record["pubkey"],
+        "agt_pda": record.get("agt_pda"),
+        "attestation_sig": record.get("attestation_sig"),
+        "completed_at": int(record["completed_at"] * 1000) if record.get("completed_at") else None,
+    }
+
+
+
 if __name__ == "__main__":
     import uvicorn
 

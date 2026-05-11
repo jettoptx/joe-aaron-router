@@ -49,6 +49,7 @@ from pydantic import BaseModel
 # inside this router are lazily initialized — missing env vars only
 # blow up when a donation actually arrives, not at import time.
 from routers.donations import router as donations_router
+from routers.devnet_audit import router as devnet_audit_router
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 # Existing Jett Auth config (Jetson defaults preserved).
@@ -148,6 +149,12 @@ app.add_middleware(
 # Mount donor-reward routes (POST /donations/claim, /donations/webhooks/helius,
 # GET /donations/status/{sig}, POST /donations/admin/replay/{sig}).
 app.include_router(donations_router)
+
+# Mount devnet-only AARON-audit self-serve endpoints (POST /audit/devnet,
+# GET /audit/devnet/status/{wallet}). Gated by DEVNET_AUDIT_ENABLED env var
+# + genesis-hash check inside the router — mainnet deployments leave the
+# env unset and the endpoints return 503.
+app.include_router(devnet_audit_router)
 
 
 # ─── Session Cleanup ─────────────────────────────────────────────────────────

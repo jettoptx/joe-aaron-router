@@ -11,7 +11,7 @@ import { createHash } from "crypto";
 
 /* ─── Configuration ─── */
 
-const AARON_BASE = "https://jettoptx-joe.taile11759.ts.net/aaron";
+const AARON_BASE = process.env.AARON_BASE_URL ?? "https://aaron.jettoptics.ai";
 const XRPL_HOOK_ACCOUNT = "rLXCpNStZodh9HjXn5DyoSFMKies1vKBUG";
 const ANODOS_ACCOUNT = "r21wnrTT2G52FcKrTBAb8hhn4aGSGn1eX";
 const HELIUS_RPC = process.env.HELIUS_RPC_URL ?? `https://devnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY ?? ""}`;
